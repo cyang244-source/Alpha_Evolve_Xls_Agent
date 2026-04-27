@@ -94,28 +94,7 @@ The included patch file is:
 Alpha_Evolve_XLS_Agent/xls_patch/xls_scheduler_changes.patch
 ```
 
-### Option A: Copy the modified files manually
-
-Copy the files under:
-
-```text
-Alpha_Evolve_XLS_Agent/xls_patch/xls/
-```
-
-into the matching paths inside the upstream `xls` checkout.
-
-The main modified files are:
-
-- `xls/scheduling/BUILD`
-- `xls/scheduling/heuristic_scheduler.cc`
-- `xls/scheduling/heuristic_scheduler.h`
-- `xls/scheduling/run_pipeline_schedule.cc`
-- `xls/scheduling/scheduling_options.cc`
-- `xls/scheduling/scheduling_options.h`
-- `xls/tools/scheduling_options_flags.cc`
-- `xls/tools/scheduling_options_flags.proto`
-
-### Option B: Apply the patch file
+Apply the provided patch file to the upstream `xls` checkout:
 
 From the root of the upstream `xls` repository, apply:
 
