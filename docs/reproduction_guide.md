@@ -1,0 +1,256 @@
+# Reproducing the AI-Agent Workflow with Google XLS
+
+This document explains how to run the AI-agent-driven scheduling workflow from this project on top of the upstream [Google XLS](https://github.com/google/xls) codebase.
+
+The goal is to let a user run the workflow and generate their own results, rather than reuse pre-generated experiment outputs.
+
+## What this repository provides
+
+This repository contains the project-specific components of the workflow:
+
+- XLS scheduler-related source modifications in `xls_patch/`
+- workflow scripts in `scripts/`
+- agent prompt context in `agent_docs/`
+- benchmark IR inputs in `datasets/ir/`
+- project documentation in `docs/`
+
+This repository does **not** include the full Google XLS codebase. You must combine it with a separate checkout of upstream XLS.
+
+## Prerequisites
+
+Before starting, make sure your environment has:
+
+- `git`
+- `python3`
+- `bazel`
+- a working environment capable of building Google XLS
+- access to an AI agent runtime if you want to run the full `run_agent.py` loop
+
+## Overview of the setup
+
+You will need two repositories:
+
+1. this repository: `Alpha_Evolve_XLS_Agent`
+2. the upstream `google/xls` repository
+
+The overall process is:
+
+1. clone both repositories
+2. apply the project-specific XLS source modifications
+3. place the workflow scripts, agent documents, and benchmark dataset into the XLS workspace
+4. build the required XLS target
+5. run the AI-agent workflow
+
+## Step 1. Clone Google XLS
+
+Clone the upstream repository:
+
+```bash
+git clone https://github.com/google/xls.git
+cd xls
+```
+
+This `xls` directory will be the workspace where the workflow runs.
+
+## Step 2. Clone this project repository
+
+Clone this repository separately:
+
+```bash
+git clone <your-project-repo-url>
+```
+
+For example:
+
+```bash
+git clone https://github.com/<your-username>/Alpha_Evolve_XLS_Agent.git
+```
+
+In the rest of this document, we assume the project repository is available locally as:
+
+```text
+Alpha_Evolve_XLS_Agent/
+```
+
+## Step 3. Apply the XLS source modifications
+
+This project depends on scheduler-related changes to the upstream XLS source tree.
+
+The modified files are provided in:
+
+```text
+Alpha_Evolve_XLS_Agent/xls_patch/
+```
+
+The patch summary is documented in:
+
+```text
+Alpha_Evolve_XLS_Agent/xls_patch/PATCH_SUMMARY.md
+```
+
+The included patch file is:
+
+```text
+Alpha_Evolve_XLS_Agent/xls_patch/xls_scheduler_changes.patch
+```
+
+### Option A: Copy the modified files manually
+
+Copy the files under:
+
+```text
+Alpha_Evolve_XLS_Agent/xls_patch/xls/
+```
+
+into the matching paths inside the upstream `xls` checkout.
+
+The main modified files are:
+
+- `xls/scheduling/BUILD`
+- `xls/scheduling/heuristic_scheduler.cc`
+- `xls/scheduling/heuristic_scheduler.h`
+- `xls/scheduling/run_pipeline_schedule.cc`
+- `xls/scheduling/scheduling_options.cc`
+- `xls/scheduling/scheduling_options.h`
+- `xls/tools/scheduling_options_flags.cc`
+- `xls/tools/scheduling_options_flags.proto`
+
+### Option B: Apply the patch file
+
+From the root of the upstream `xls` repository, apply:
+
+```bash
+git apply /path/to/Alpha_Evolve_XLS_Agent/xls_patch/xls_scheduler_changes.patch
+```
+
+After this step, the upstream XLS checkout should contain the scheduling-related changes required by the project.
+
+## Step 4. Place the workflow scripts into the XLS workspace
+
+Copy the scripts from:
+
+```text
+Alpha_Evolve_XLS_Agent/scripts/
+```
+
+into the `xls/xls/` directory of the upstream checkout.
+
+The scripts are:
+
+- `run_agent.py`
+- `PPA_script.sh`
+- `extract_ppa_features.sh`
+- `run_baseline_ppa.sh`
+
+After copying, the upstream checkout should contain:
+
+```text
+xls/
+  xls/
+    run_agent.py
+    PPA_script.sh
+    extract_ppa_features.sh
+    run_baseline_ppa.sh
+```
+
+## Step 5. Place the agent documents into the XLS workspace
+
+Copy the files from:
+
+```text
+Alpha_Evolve_XLS_Agent/agent_docs/
+```
+
+into:
+
+```text
+xls/xls/Agent_docs/
+```
+
+These files provide the prompt context and scheduling guidance used by the AI-agent workflow.
+
+## Step 6. Place the benchmark dataset into the XLS workspace
+
+Copy the benchmark IR files from:
+
+```text
+Alpha_Evolve_XLS_Agent/datasets/ir/
+```
+
+into:
+
+```text
+xls/my_ir_dataset/
+```
+
+The dataset includes:
+
+- `adler32.ir`
+- `crc32.ir`
+- `prefix_sum.ir`
+- `sparse_prefix_sum.ir`
+- `matmul_4x4_opt_ir.ir`
+- `sha256.ir`
+
+## Step 7. Build the required XLS target
+
+From the root of the upstream `xls` repository, build the benchmark binary:
+
+```bash
+bazel --batch build --jobs=16 -c opt //xls/dev_tools:benchmark_main
+```
+
+This is the main XLS target used by the workflow.
+
+## Step 8. Run the AI-agent workflow
+
+From the root of the upstream `xls` repository, run:
+
+```bash
+python3 xls/run_agent.py
+```
+
+This script orchestrates the workflow by:
+
+1. generating prompts for the AI agent
+2. invoking the AI-agent loop
+3. selecting scheduling strategies and pipeline-stage configurations
+4. rebuilding the required XLS target
+5. running benchmark evaluation on the IR dataset
+6. extracting timing- and register-related metrics into CSV summaries
+
+## Step 9. Inspect the generated outputs
+
+Typical outputs include:
+
+- iteration directories such as `iteration_1/`, `iteration_2/`, and so on
+- benchmark report files generated by `PPA_script.sh`
+- summary CSV files generated by `extract_ppa_features.sh`
+- agent decision files such as `next_attempt.json`
+- iteration notes such as `strategy_notes.txt`
+
+These outputs can be used to analyze:
+
+- whether generated schedulers outperform baseline behavior
+- how pipeline-stage exploration affects timing behavior
+- how the agent adapts its proposals based on prior results
+
+## Notes
+
+- This project is intended to reproduce the workflow, not to distribute a prebuilt XLS environment.
+- The main runtime dependency for the workflow is `//xls/dev_tools:benchmark_main`.
+- The broader project may also use tools such as `xlscc`, `opt_main`, and `codegen_main`, but they are not required for the main AI-agent scheduling loop described here.
+- The repository intentionally does not include Bazel build outputs, generated logs, or large experiment-result directories.
+
+## Directory mapping summary
+
+| Project repository | Target location in Google XLS |
+|---|---|
+| `xls_patch/xls/scheduling/*` | `xls/scheduling/*` |
+| `xls_patch/xls/tools/*` | `xls/tools/*` |
+| `scripts/run_agent.py` | `xls/run_agent.py` |
+| `scripts/PPA_script.sh` | `xls/PPA_script.sh` |
+| `scripts/extract_ppa_features.sh` | `xls/extract_ppa_features.sh` |
+| `scripts/run_baseline_ppa.sh` | `xls/run_baseline_ppa.sh` |
+| `agent_docs/*` | `xls/Agent_docs/*` |
+| `datasets/ir/*` | `my_ir_dataset/*` |
