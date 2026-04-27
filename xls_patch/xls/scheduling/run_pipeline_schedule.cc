@@ -1,0 +1,1383 @@
+// Copyright 2023 The XLS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "xls/scheduling/run_pipeline_schedule.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <random>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "absl/algorithm/container.h"
+#include "absl/base/log_severity.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/random/distributions.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/types/span.h"
+#include "xls/common/logging/log_lines.h"
+#include "xls/common/math_util.h"
+#include "xls/common/status/ret_check.h"
+#include "xls/common/status/status_builder.h"
+#include "xls/common/status/status_macros.h"
+#include "xls/data_structures/binary_search.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/fdo/delay_manager.h"
+#include "xls/fdo/iterative_sdc_scheduler.h"
+#include "xls/fdo/synthesizer.h"
+#include "xls/ir/channel.h"
+#include "xls/ir/channel_ops.h"
+#include "xls/ir/function.h"
+#include "xls/ir/function_base.h"
+#include "xls/ir/node.h"
+#include "xls/ir/node_util.h"
+#include "xls/ir/nodes.h"
+#include "xls/ir/op.h"
+#include "xls/ir/proc.h"
+#include "xls/ir/proc_elaboration.h"
+#include "xls/ir/topo_sort.h"
+#include "xls/scheduling/heuristic_scheduler.h"
+#include "xls/scheduling/min_cut_scheduler.h"
+#include "xls/scheduling/pipeline_schedule.h"
+#include "xls/scheduling/schedule_bounds.h"
+#include "xls/scheduling/schedule_graph.h"
+#include "xls/scheduling/schedule_util.h"
+#include "xls/scheduling/scheduling_options.h"
+#include "xls/scheduling/sdc_scheduler.h"
+
+namespace xls {
+
+namespace {
+
+absl::StatusOr<int64_t> ComputeMaxStageDelayPs(
+    FunctionBase* f, const PipelineSchedule& schedule,
+    const DelayEstimator& delay_estimator) {
+  int64_t max_stage_delay_ps = 0;
+  absl::flat_hash_map<Node*, int64_t> completion_time_ps;
+  for (Node* node : TopoSort(f)) {
+    if (IsUntimed(node)) {
+      completion_time_ps[node] = 0;
+      continue;
+    }
+    int64_t start_time_ps = 0;
+    for (Node* operand : node->operands()) {
+      if (IsUntimed(operand)) {
+        continue;
+      }
+      if (schedule.cycle(operand) == schedule.cycle(node)) {
+        start_time_ps = std::max(start_time_ps, completion_time_ps[operand]);
+      }
+    }
+    XLS_ASSIGN_OR_RETURN(int64_t node_delay_ps,
+                         delay_estimator.GetOperationDelayInPs(node));
+    completion_time_ps[node] = start_time_ps + node_delay_ps;
+    max_stage_delay_ps =
+        std::max(max_stage_delay_ps, completion_time_ps[node]);
+  }
+  return max_stage_delay_ps;
+}
+
+int64_t ComputePipelineFlopBits(FunctionBase* f,
+                                const PipelineSchedule& schedule) {
+  int64_t total_flop_bits = 0;
+  absl::flat_hash_set<Node*> dead_after_synthesis =
+      GetDeadAfterSynthesisNodes(f);
+  for (int64_t cycle = 0; cycle < schedule.length(); ++cycle) {
+    for (Node* node : schedule.GetLiveOutOfCycle(cycle)) {
+      if (dead_after_synthesis.contains(node)) {
+        continue;
+      }
+      if (f->HasImplicitUse(node) ||
+          absl::c_any_of(node->users(), [&](Node* user) {
+            return schedule.IsScheduled(user) && schedule.cycle(user) > cycle &&
+                   dead_after_synthesis.contains(user);
+          })) {
+        total_flop_bits += node->GetType()->GetFlatBitCount();
+      }
+    }
+  }
+  return total_flop_bits;
+}
+
+absl::StatusOr<int64_t> HybridScheduleScore(
+    FunctionBase* f, const PipelineSchedule& schedule,
+    const DelayEstimator& delay_estimator) {
+  XLS_ASSIGN_OR_RETURN(
+      int64_t max_stage_delay_ps,
+      ComputeMaxStageDelayPs(f, schedule, delay_estimator));
+  // Prefer fewer pipeline flop bits first, then a smaller maximum stage delay.
+  return ComputePipelineFlopBits(f, schedule) * 1000000LL + max_stage_delay_ps;
+}
+
+// Returns the nodes of `f` which must be scheduled in the first stage of a
+// pipeline. For functions this is parameters.
+std::vector<Node*> FirstStageNodes(FunctionBase* f) {
+  if (Function* function = dynamic_cast<Function*>(f)) {
+    return std::vector<Node*>(function->params().begin(),
+                              function->params().end());
+  }
+
+  return {};
+}
+
+// Returns the nodes of `f` which must be scheduled in the final stage of a
+// pipeline. For functions this is the return value.
+std::vector<Node*> FinalStageNodes(FunctionBase* f) {
+  if (Function* function = dynamic_cast<Function*>(f)) {
+    // If the return value is a parameter, then we do not force the return value
+    // to be scheduled in the final stage because, as a parameter, the node must
+    // be in the first stage.
+    if (function->return_value()->Is<Param>()) {
+      return {};
+    }
+    return {function->return_value()};
+  }
+
+  return {};
+}
+
+// Tighten `bounds` to the ASAP/ALAP bounds for each node. If `schedule_length`
+// is given, then the ALAP bounds are computed with the given length. Otherwise,
+// we use the minimum viable pipeline length, per the ASAP bounds.
+//
+// Both schedules will be feasible if no other scheduling constraints are
+// applied.
+absl::Status TightenBounds(sched::ScheduleBounds& bounds, FunctionBase* f,
+                           std::optional<int64_t> schedule_length) {
+  // If we have a schedule length give everything that upper bound.
+  if (schedule_length.has_value()) {
+    for (Node* node : f->nodes()) {
+      XLS_RETURN_IF_ERROR(
+          bounds.TightenNodeUb(node, schedule_length.value() - 1));
+    }
+  }
+  // If we have a schedule_length (and therefore a small-ish max stage) we can
+  // try to propagate forever since we will hit that schedule length before
+  // long.
+  std::optional<int64_t> propagation_fuel =
+      schedule_length ? std::nullopt : std::make_optional<int64_t>(6);
+  XLS_RETURN_IF_ERROR(bounds.PropagateBounds(propagation_fuel))
+      << "Failed to schedule bounds for " << f->name() << ".";
+  return absl::OkStatus();
+}
+
+int64_t CountTimedUsers(Node* node) {
+  int64_t timed_users = 0;
+  for (Node* user : node->users()) {
+    if (!IsUntimed(user)) {
+      ++timed_users;
+    }
+  }
+  return timed_users;
+}
+
+absl::StatusOr<absl::flat_hash_map<Node*, int64_t>> ComputeReversePathDelayPs(
+    FunctionBase* f, const DelayEstimator& delay_estimator) {
+  absl::flat_hash_map<Node*, int64_t> reverse_path_delay_ps;
+  for (Node* node : ReverseTopoSort(f)) {
+    if (IsUntimed(node)) {
+      reverse_path_delay_ps[node] = 0;
+      continue;
+    }
+    XLS_ASSIGN_OR_RETURN(int64_t node_delay_ps,
+                         delay_estimator.GetOperationDelayInPs(node));
+    int64_t best_successor_delay_ps = 0;
+    for (Node* user : node->users()) {
+      if (IsUntimed(user)) {
+        continue;
+      }
+      best_successor_delay_ps =
+          std::max(best_successor_delay_ps, reverse_path_delay_ps[user]);
+    }
+    reverse_path_delay_ps[node] = node_delay_ps + best_successor_delay_ps;
+  }
+  return reverse_path_delay_ps;
+}
+
+absl::StatusOr<PipelineSchedule> ScheduleByIter1ListHeuristic(
+    FunctionBase* f, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options, int64_t clock_period_ps) {
+  XLS_RET_CHECK(options.pipeline_stages().has_value());
+  const int64_t pipeline_stages = *options.pipeline_stages();
+
+  XLS_ASSIGN_OR_RETURN(
+      auto bounds,
+      sched::ScheduleBounds::Create(
+          ScheduleGraph::Create(f, GetDeadAfterSynthesisNodes(f)),
+          clock_period_ps, delay_estimator,
+          f->GetInitiationInterval().value_or(1), options.constraints()));
+  using LastStageConstraint =
+      sched::ScheduleBounds::NodeSchedulingConstraint::LastStageConstraint;
+  for (Node* n : FirstStageNodes(f)) {
+    bounds.AddConstraint(NodeInCycleConstraint{n, 0});
+  }
+  for (Node* n : FinalStageNodes(f)) {
+    bounds.AddConstraint(LastStageConstraint{n});
+  }
+  XLS_RETURN_IF_ERROR(TightenBounds(bounds, f, pipeline_stages));
+
+  XLS_ASSIGN_OR_RETURN(
+      absl::flat_hash_map<Node*, int64_t> reverse_path_delay_ps,
+      ComputeReversePathDelayPs(f, delay_estimator));
+
+  absl::flat_hash_map<Node*, int64_t> node_delay_ps;
+  for (Node* node : TopoSort(f)) {
+    if (IsUntimed(node)) {
+      continue;
+    }
+    XLS_ASSIGN_OR_RETURN(int64_t delay_ps,
+                         delay_estimator.GetOperationDelayInPs(node));
+    node_delay_ps[node] = delay_ps;
+  }
+
+  ScheduleCycleMap cycle_map;
+  absl::flat_hash_map<Node*, int64_t> completion_time_ps;
+  for (int64_t stage = 0; stage < pipeline_stages; ++stage) {
+    while (true) {
+      Node* best_node = nullptr;
+      int64_t best_finish_time_ps = 0;
+      int64_t best_mobility = std::numeric_limits<int64_t>::max();
+      int64_t best_reverse_path_ps = std::numeric_limits<int64_t>::min();
+      int64_t best_fanout = std::numeric_limits<int64_t>::min();
+      int64_t best_width = std::numeric_limits<int64_t>::min();
+
+      for (Node* node : TopoSort(f)) {
+        if (IsUntimed(node) || cycle_map.contains(node)) {
+          continue;
+        }
+        if (bounds.lb(node) > stage || bounds.ub(node) < stage) {
+          continue;
+        }
+
+        bool operands_ready = true;
+        int64_t start_time_ps = 0;
+        for (Node* operand : node->operands()) {
+          if (IsUntimed(operand)) {
+            continue;
+          }
+          auto operand_it = cycle_map.find(operand);
+          if (operand_it == cycle_map.end()) {
+            operands_ready = false;
+            break;
+          }
+          if (operand_it->second == stage) {
+            start_time_ps =
+                std::max(start_time_ps, completion_time_ps.at(operand));
+          }
+        }
+        if (!operands_ready) {
+          continue;
+        }
+
+        const int64_t finish_time_ps = start_time_ps + node_delay_ps.at(node);
+        if (finish_time_ps > clock_period_ps) {
+          continue;
+        }
+
+        const int64_t mobility = bounds.ub(node) - bounds.lb(node);
+        const int64_t reverse_path_ps = reverse_path_delay_ps.at(node);
+        const int64_t fanout = CountTimedUsers(node);
+        const int64_t bit_width = node->GetType()->GetFlatBitCount();
+        const bool is_better =
+            best_node == nullptr || mobility < best_mobility ||
+            (mobility == best_mobility &&
+             reverse_path_ps > best_reverse_path_ps) ||
+            (mobility == best_mobility &&
+             reverse_path_ps == best_reverse_path_ps && fanout > best_fanout) ||
+            (mobility == best_mobility &&
+             reverse_path_ps == best_reverse_path_ps && fanout == best_fanout &&
+             bit_width > best_width) ||
+            (mobility == best_mobility &&
+             reverse_path_ps == best_reverse_path_ps && fanout == best_fanout &&
+             bit_width == best_width && finish_time_ps > best_finish_time_ps);
+        if (!is_better) {
+          continue;
+        }
+        best_node = node;
+        best_finish_time_ps = finish_time_ps;
+        best_mobility = mobility;
+        best_reverse_path_ps = reverse_path_ps;
+        best_fanout = fanout;
+        best_width = bit_width;
+      }
+
+      if (best_node == nullptr) {
+        break;
+      }
+      cycle_map[best_node] = stage;
+      completion_time_ps[best_node] = best_finish_time_ps;
+    }
+
+    for (Node* node : f->nodes()) {
+      if (IsUntimed(node) || cycle_map.contains(node)) {
+        continue;
+      }
+      if (bounds.ub(node) <= stage) {
+        return absl::ResourceExhaustedError(absl::StrFormat(
+            "iter_1 list scheduling could not place `%s` by stage %d within "
+            "its ASAP/ALAP bounds",
+            node->GetName(), stage));
+      }
+    }
+  }
+
+  for (Node* node : f->nodes()) {
+    if (!IsUntimed(node) && !cycle_map.contains(node)) {
+      return absl::ResourceExhaustedError(absl::StrFormat(
+          "iter_1 list scheduling left `%s` unscheduled", node->GetName()));
+    }
+  }
+
+  PipelineSchedule schedule(f, cycle_map, pipeline_stages);
+  XLS_RETURN_IF_ERROR(schedule.Verify());
+  XLS_RETURN_IF_ERROR(schedule.VerifyTiming(clock_period_ps, delay_estimator));
+  XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(options.constraints(),
+                                                 f->GetInitiationInterval()));
+  return schedule;
+}
+
+// Returns the critical path through the given nodes (ordered topologically),
+// ignoring nodes that will be dead after synthesis.
+absl::StatusOr<int64_t> ComputeCriticalPath(
+    absl::Span<Node* const> topo_sort,
+    const absl::flat_hash_set<Node*>& dead_after_synthesis,
+    const DelayEstimator& delay_estimator) {
+  int64_t function_cp = 0;
+  absl::flat_hash_map<Node*, int64_t> node_cp;
+  for (Node* node : topo_sort) {
+    if (dead_after_synthesis.contains(node)) {
+      continue;
+    }
+    int64_t node_start = 0;
+    for (Node* operand : node->operands()) {
+      node_start = std::max(node_start, node_cp[operand]);
+    }
+    XLS_ASSIGN_OR_RETURN(int64_t node_delay,
+                         delay_estimator.GetOperationDelayInPs(node));
+    node_cp[node] = node_start + node_delay;
+    function_cp = std::max(function_cp, node_cp[node]);
+  }
+  return function_cp;
+}
+absl::StatusOr<int64_t> ComputeCriticalPath(
+    FunctionBase* f, const DelayEstimator& delay_estimator) {
+  return ComputeCriticalPath(TopoSort(f), GetDeadAfterSynthesisNodes(f),
+                             delay_estimator);
+}
+
+// Returns the minimum clock period in picoseconds for which it is feasible to
+// schedule the function into a pipeline with the given number of stages. If
+// `target_clock_period_ps` is specified, will not try to check lower clock
+// periods than this.
+absl::StatusOr<int64_t> FindMinimumClockPeriod(
+    FunctionBase* f, std::optional<int64_t> pipeline_stages,
+    std::optional<int64_t> worst_case_throughput,
+    const DelayEstimator& delay_estimator, SDCScheduler& scheduler,
+    SchedulingFailureBehavior failure_behavior,
+    std::optional<int64_t> target_clock_period_ps = std::nullopt) {
+  VLOG(4) << "FindMinimumClockPeriod()";
+  VLOG(4) << "  pipeline stages = "
+          << (pipeline_stages.has_value() ? absl::StrCat(*pipeline_stages)
+                                          : "(unspecified)");
+  XLS_ASSIGN_OR_RETURN(int64_t function_cp_ps,
+                       ComputeCriticalPath(f, delay_estimator));
+
+  // The upper bound of the search is simply the critical path of the entire
+  // function, and the lower bound is the critical path delay evenly distributed
+  // across our pipeline stages (rounded up). It's possible the upper bound is
+  // the best you can do if there exists a single operation with delay equal to
+  // the critical-path delay of the function.
+  int64_t pessimistic_clk_period_ps = std::max(int64_t{1}, function_cp_ps);
+  int64_t optimistic_clk_period_ps = 1;
+  if (pipeline_stages.has_value()) {
+    optimistic_clk_period_ps =
+        std::max(optimistic_clk_period_ps,
+                 CeilOfRatio(function_cp_ps, *pipeline_stages));
+  }
+  if (target_clock_period_ps.has_value()) {
+    // Don't check any clock period less than the specified target.
+    optimistic_clk_period_ps =
+        std::max(optimistic_clk_period_ps, *target_clock_period_ps);
+    pessimistic_clk_period_ps =
+        std::max(pessimistic_clk_period_ps, *target_clock_period_ps);
+  }
+  VLOG(4) << absl::StreamFormat("Binary searching over interval [%d, %d]",
+                                optimistic_clk_period_ps,
+                                pessimistic_clk_period_ps);
+
+  // Check that it is in fact possible to
+  // schedule this function at all; if not, return a useful error.
+  XLS_RETURN_IF_ERROR(scheduler
+                          .Schedule(pipeline_stages, pessimistic_clk_period_ps,
+                                    failure_behavior,
+                                    /*check_feasibility=*/true,
+                                    worst_case_throughput)
+                          .status())
+          .SetPrepend()
+      << absl::StrFormat("Impossible to schedule %s %s as specified; ",
+                         (f->IsProc() ? "proc" : "function"), f->name());
+
+  // Don't waste time explaining infeasibility for the failing points in the
+  // search.
+  failure_behavior.explain_infeasibility = false;
+  int64_t min_clk_period_ps = BinarySearchMinTrue(
+      optimistic_clk_period_ps, pessimistic_clk_period_ps,
+      [&](int64_t clk_period_ps) {
+        return scheduler
+            .Schedule(pipeline_stages, clk_period_ps, failure_behavior,
+                      /*check_feasibility=*/true, worst_case_throughput)
+            .ok();
+      },
+      BinarySearchAssumptions::kEndKnownTrue);
+  VLOG(4) << "minimum clock period = " << min_clk_period_ps;
+
+  return min_clk_period_ps;
+}
+
+// Returns the minimum inverse worst-case throughput for which it is feasible to
+// schedule the function into a pipeline with the given number of stages and
+// target clock period.
+absl::StatusOr<int64_t> FindMinimumWorstCaseThroughput(
+    FunctionBase* f, std::optional<int64_t> pipeline_stages,
+    int64_t clock_period_ps, SDCScheduler& scheduler,
+    SchedulingFailureBehavior failure_behavior) {
+  VLOG(4) << "FindMinimumWorstCaseThroughput()";
+  VLOG(4) << "  pipeline stages = "
+          << (pipeline_stages.has_value() ? absl::StrCat(*pipeline_stages)
+                                          : "(unspecified)")
+          << ", clock period = " << clock_period_ps << " ps";
+
+  Proc* proc = f->AsProcOrDie();
+
+  // Check that it is in fact possible to schedule this function at all, with no
+  // worst-case throughput bound; if not, return a useful error.
+  XLS_ASSIGN_OR_RETURN(
+      ScheduleCycleMap schedule_cycle_map,
+      scheduler.Schedule(pipeline_stages, clock_period_ps, failure_behavior,
+                         /*check_feasibility=*/true,
+                         /*worst_case_throughput=*/0),
+      _.SetPrepend() << absl::StrFormat(
+          "Impossible to schedule %s %s as specified; ",
+          (f->IsProc() ? "proc" : "function"), f->name()));
+
+  // Extract the worst-case throughput from this schedule as an upper bound.
+  int64_t pessimistic_worst_case_throughput = 1;
+  if (f->IsProc()) {
+    for (Next* next : proc->next_values()) {
+      Node* state_read = next->state_read();
+      const int64_t backedge_length =
+          schedule_cycle_map[next] - schedule_cycle_map[state_read];
+      pessimistic_worst_case_throughput =
+          std::max(pessimistic_worst_case_throughput, backedge_length + 1);
+    }
+  }
+  VLOG(4) << absl::StreamFormat(
+      "Schedules at worst-case throughput %d; now binary searching over "
+      "interval [1, %d]",
+      pessimistic_worst_case_throughput, pessimistic_worst_case_throughput);
+
+  // Don't waste time explaining infeasibility for the failing points in the
+  // search.
+  failure_behavior.explain_infeasibility = false;
+  int64_t min_worst_case_throughput = BinarySearchMinTrue(
+      1, pessimistic_worst_case_throughput,
+      [&](int64_t worst_case_throughput) {
+        return scheduler
+            .Schedule(pipeline_stages, clock_period_ps, failure_behavior,
+                      /*check_feasibility=*/true,
+                      /*worst_case_throughput=*/worst_case_throughput)
+            .ok();
+      },
+      BinarySearchAssumptions::kEndKnownTrue);
+  VLOG(4) << "minimum worst-case throughput = " << min_worst_case_throughput;
+
+  return min_worst_case_throughput;
+}
+
+// Returns true if the given node communicates via a channel which is on the
+// interface of the top-level proc.
+// TODO(meheff): Revisit whether this is the right thing to do.  This will
+// return true if any instance of the proc has the channel as an I/O. With
+// multiple instantiations, this could lead to unexpected behavior.
+bool IsExternalIoNode(ChannelNode* node,
+                      const std::optional<const ProcElaboration*> elab) {
+  Proc* proc = node->function_base()->AsProcOrDie();
+  if (proc->is_new_style_proc()) {
+    // Channels are proc-scoped.
+    absl::StatusOr<ChannelInterface*> channel_interface =
+        proc->GetChannelInterface(node->As<ChannelNode>()->channel_name(),
+                                  node->Is<Send>()
+                                      ? ChannelDirection::kSend
+                                      : ChannelDirection::kReceive);
+    CHECK_OK(channel_interface.status());
+    CHECK(elab.has_value());
+    for (ChannelInstance* channel_instance :
+         (*elab)->GetInstancesOfChannelInterface(channel_interface.value())) {
+      if ((*elab)->IsTopInterfaceChannel(channel_instance)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Channels are globally scoped.
+  absl::StatusOr<Channel*> chan = GetChannelUsedByNode(node);
+  CHECK_OK(chan.status());
+  return (*chan)->supported_ops() != ChannelOps::kSendReceive;
+}
+
+absl::StatusOr<int64_t> ApplyClockMargin(const SchedulingOptions& options,
+                                         int64_t clock_period_ps) {
+  if (!options.clock_margin_percent().has_value()) {
+    return clock_period_ps;
+  }
+
+  int64_t original_clock_period_ps = clock_period_ps;
+  clock_period_ps -=
+      (clock_period_ps * *options.clock_margin_percent() + 50) / 100;
+  if (clock_period_ps <= 0) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Clock period non-positive (%dps) after adjusting for margin. "
+        "Original clock period: %dps, clock margin: %d%%",
+        clock_period_ps, original_clock_period_ps,
+        *options.clock_margin_percent()));
+  }
+  return clock_period_ps;
+}
+
+absl::Status GenerateHelpfulAsapError(absl::Status&& orig_status,
+                                      FunctionBase* f, int64_t clock_period_ps,
+                                      const DelayEstimator& delay_estimator,
+                                      const SchedulingOptions& options) {
+  xabsl::StatusBuilder status(std::move(orig_status));
+  // Try to figure out what the actual required stages are.
+  if (options.pipeline_stages().has_value()) {
+    XLS_ASSIGN_OR_RETURN(
+        auto bounds,
+        sched::ScheduleBounds::Create(
+            ScheduleGraph::Create(f, GetDeadAfterSynthesisNodes(f)),
+            clock_period_ps, delay_estimator,
+            f->GetInitiationInterval().value_or(1), options.constraints()),
+        std::move(status)
+            << "(Failed to create schedule bounds for error message creation)");
+    // Add first and last stage constraints.
+    using LastStageConstraint =
+        sched::ScheduleBounds::NodeSchedulingConstraint::LastStageConstraint;
+    for (Node* n : FirstStageNodes(f)) {
+      bounds.AddConstraint(NodeInCycleConstraint{n, 0});
+    }
+    for (Node* n : FinalStageNodes(f)) {
+      bounds.AddConstraint(LastStageConstraint{n});
+    }
+    absl::Status no_length =
+        TightenBounds(bounds, f, /*schedule_length=*/std::nullopt);
+    if (no_length.ok()) {
+      return (status << absl::StrFormat("Function %s cannot be scheduled in %d "
+                                        "stages. Computed minimum stage count "
+                                        "is %d.",
+                                        f->name(),
+                                        options.pipeline_stages().value(),
+                                        bounds.max_lower_bound() + 1))
+          .SetCode(absl::StatusCode::kResourceExhausted);
+    } else {
+      return (status << "Function " << f->name()
+                     << " cannot be scheduled in any number of stages via ASAP "
+                        "bounds. Some constraints may be unsatisfiable or "
+                        "require a full SDC schedule to resolve.")
+          .SetCode(absl::StatusCode::kResourceExhausted);
+    }
+  }
+  return status;
+}
+
+absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+    FunctionBase* f, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options,
+    const std::optional<const ProcElaboration*> elab,
+    const synthesis::Synthesizer* synthesizer) {
+  if (options.strategy() == SchedulingStrategy::HYBRID) {
+    SchedulingOptions sdc_options = options;
+    sdc_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule sdc_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, sdc_options, elab,
+                                    synthesizer));
+
+    SchedulingOptions min_cut_options = options;
+    min_cut_options.strategy(SchedulingStrategy::MIN_CUT);
+    absl::StatusOr<PipelineSchedule> min_cut_schedule =
+        RunPipelineScheduleInternal(f, delay_estimator, min_cut_options, elab,
+                                    synthesizer);
+    if (!min_cut_schedule.ok()) {
+      VLOG(1) << "Hybrid scheduler falling back to SDC for `" << f->name()
+              << "` because min-cut failed: " << min_cut_schedule.status();
+      return sdc_schedule;
+    }
+
+    XLS_ASSIGN_OR_RETURN(int64_t sdc_score,
+                         HybridScheduleScore(f, sdc_schedule, delay_estimator));
+    XLS_ASSIGN_OR_RETURN(
+        int64_t min_cut_score,
+        HybridScheduleScore(f, *min_cut_schedule, delay_estimator));
+    if (min_cut_score < sdc_score) {
+      VLOG(1) << "Hybrid scheduler selected min-cut schedule for `"
+              << f->name() << "` (score=" << min_cut_score
+              << " vs sdc=" << sdc_score << ")";
+      return *std::move(min_cut_schedule);
+    }
+    VLOG(1) << "Hybrid scheduler selected SDC schedule for `" << f->name()
+            << "` (score=" << sdc_score << " vs min-cut=" << min_cut_score
+            << ")";
+    return sdc_schedule;
+  }
+
+  if (options.strategy() == SchedulingStrategy::HEURISTIC) {
+    SchedulingOptions seed_options = options;
+    seed_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule seed_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, seed_options, elab,
+                                    synthesizer));
+    int64_t heuristic_clock_period_ps =
+        options.clock_period_ps().value_or(
+            seed_schedule.min_clock_period_ps().value_or(0));
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule refined_schedule,
+        HeuristicRefineSchedule(f, delay_estimator, seed_schedule,
+                                heuristic_clock_period_ps,
+                                options.constraints(),
+                                f->GetInitiationInterval()));
+    return refined_schedule;
+  }
+
+  if (options.strategy() == SchedulingStrategy::ITER_1) {
+    if (options.clock_period_ps().has_value()) {
+      absl::StatusOr<PipelineSchedule> iter_1_schedule =
+          ScheduleByIter1ListHeuristic(f, delay_estimator, options,
+                                       *options.clock_period_ps());
+      if (iter_1_schedule.ok()) {
+        return *std::move(iter_1_schedule);
+      }
+      VLOG(1) << "ITER_1 list scheduling fell back to min-cut for `"
+              << f->name() << "`: " << iter_1_schedule.status();
+      SchedulingOptions min_cut_options = options;
+      min_cut_options.strategy(SchedulingStrategy::MIN_CUT);
+      return RunPipelineScheduleInternal(f, delay_estimator, min_cut_options,
+                                         elab, synthesizer);
+    }
+
+    XLS_RET_CHECK(options.pipeline_stages().has_value());
+    XLS_ASSIGN_OR_RETURN(int64_t function_cp_ps,
+                         ComputeCriticalPath(f, delay_estimator));
+    int64_t low_clock_period_ps =
+        std::max<int64_t>(1, CeilOfRatio(function_cp_ps,
+                                         *options.pipeline_stages()));
+    int64_t high_clock_period_ps =
+        std::max(low_clock_period_ps, function_cp_ps);
+    std::optional<PipelineSchedule> best_schedule;
+    std::optional<int64_t> best_clock_period_ps;
+    while (low_clock_period_ps <= high_clock_period_ps) {
+      const int64_t trial_clock_period_ps =
+          low_clock_period_ps +
+          (high_clock_period_ps - low_clock_period_ps) / 2;
+      absl::StatusOr<PipelineSchedule> trial_schedule =
+          ScheduleByIter1ListHeuristic(f, delay_estimator, options,
+                                       trial_clock_period_ps);
+      if (trial_schedule.ok()) {
+        best_schedule = *std::move(trial_schedule);
+        best_clock_period_ps = trial_clock_period_ps;
+        high_clock_period_ps = trial_clock_period_ps - 1;
+      } else {
+        low_clock_period_ps = trial_clock_period_ps + 1;
+      }
+    }
+    if (best_schedule.has_value()) {
+      PipelineSchedule traced_schedule(
+          f, best_schedule->GetCycleMap(), options.pipeline_stages(),
+          best_clock_period_ps);
+      XLS_RETURN_IF_ERROR(traced_schedule.Verify());
+      XLS_RETURN_IF_ERROR(
+          traced_schedule.VerifyTiming(*best_clock_period_ps, delay_estimator));
+      XLS_RETURN_IF_ERROR(traced_schedule.VerifyConstraints(
+          options.constraints(), f->GetInitiationInterval()));
+      return traced_schedule;
+    }
+
+    VLOG(1) << "ITER_1 list scheduling fell back to min-cut for `" << f->name()
+            << "` after failing to find a feasible clock period";
+    SchedulingOptions min_cut_options = options;
+    min_cut_options.strategy(SchedulingStrategy::MIN_CUT);
+    return RunPipelineScheduleInternal(f, delay_estimator, min_cut_options,
+                                       elab, synthesizer);
+  }
+
+  if (options.strategy() == SchedulingStrategy::ITER_2) {
+    SchedulingOptions seed_options = options;
+    seed_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule seed_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, seed_options, elab,
+                                    synthesizer));
+    int64_t heuristic_clock_period_ps =
+        options.clock_period_ps().value_or(
+            seed_schedule.min_clock_period_ps().value_or(0));
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule refined_schedule,
+        HeuristicRefineSchedule(f, delay_estimator, seed_schedule,
+                                heuristic_clock_period_ps,
+                                options.constraints(),
+                                f->GetInitiationInterval(),
+                                {.prefer_later_moves = true,
+                                 .prioritize_stage_delay = true,
+                                 .prioritize_live_range_cost = true,
+                                 .prioritize_tail_relief_density = true,
+                                 .prioritize_next_stage_affinity = true,
+                                 .prioritize_operand_carry_cost = true,
+                                 .stage_tail_only = true,
+                                 .critical_stage_only = true,
+                                 .critical_path_only = true,
+                                 .delay_first_objective = true,
+                                 .best_improvement = true,
+                                 .max_move_distance = 2}));
+    return refined_schedule;
+  }
+
+  if (options.strategy() == SchedulingStrategy::ITER_3) {
+    SchedulingOptions seed_options = options;
+    seed_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule seed_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, seed_options, elab,
+                                    synthesizer));
+    int64_t heuristic_clock_period_ps =
+        options.clock_period_ps().value_or(
+            seed_schedule.min_clock_period_ps().value_or(0));
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule refined_schedule,
+        HeuristicRefineSchedule(f, delay_estimator, seed_schedule,
+                                heuristic_clock_period_ps,
+                                options.constraints(),
+                                f->GetInitiationInterval(),
+                                {.prefer_later_moves = true,
+                                 .prioritize_stage_delay = true,
+                                 .prioritize_operand_carry_cost = true,
+                                 .prioritize_boundary_leverage_density = true,
+                                 .prioritize_delay_fanout_leverage = true,
+                                 .critical_stage_only = true,
+                                 .stage_tail_only = true,
+                                 .critical_path_only = true,
+                                 .delay_first_objective = true,
+                                 .best_improvement = true,
+                                 .max_move_distance = 2}));
+    return refined_schedule;
+  }
+
+  if (options.strategy() == SchedulingStrategy::ITER_4) {
+    SchedulingOptions seed_options = options;
+    seed_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule seed_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, seed_options, elab,
+                                    synthesizer));
+    int64_t heuristic_clock_period_ps =
+        options.clock_period_ps().value_or(
+            seed_schedule.min_clock_period_ps().value_or(0));
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule refined_schedule,
+        HeuristicRefineSchedule(f, delay_estimator, seed_schedule,
+                                heuristic_clock_period_ps,
+                                options.constraints(),
+                                f->GetInitiationInterval(),
+                                {.prefer_later_moves = true,
+                                 .prioritize_stage_delay = true,
+                                 .prioritize_operand_carry_cost = true,
+                                 .prioritize_boundary_readiness = true,
+                                 .prioritize_delay_fanout_leverage = true,
+                                 .stage_tail_only = true,
+                                 .slowest_stage_only = true,
+                                 .critical_path_only = true,
+                                 .delay_first_objective = true,
+                                 .critical_stage_only = true,
+                                 .best_improvement = true,
+                                 .max_move_distance = 2}));
+    return refined_schedule;
+  }
+
+  if (options.strategy() == SchedulingStrategy::ITER_5) {
+    SchedulingOptions seed_options = options;
+    seed_options.strategy(SchedulingStrategy::SDC);
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule seed_schedule,
+        RunPipelineScheduleInternal(f, delay_estimator, seed_options, elab,
+                                    synthesizer));
+    int64_t heuristic_clock_period_ps =
+        options.clock_period_ps().value_or(
+            seed_schedule.min_clock_period_ps().value_or(0));
+    XLS_ASSIGN_OR_RETURN(
+        PipelineSchedule refined_schedule,
+        HeuristicRefineSchedule(f, delay_estimator, seed_schedule,
+                                heuristic_clock_period_ps,
+                                options.constraints(),
+                                f->GetInitiationInterval(),
+                                {.prefer_later_moves = true,
+                                 .prioritize_stage_delay = true,
+                                 .prioritize_operand_carry_cost = true,
+                                 .prioritize_boundary_containment_density =
+                                     true,
+                                 .prioritize_boundary_readiness = true,
+                                 .prioritize_next_stage_affinity = true,
+                                 .stage_tail_only = true,
+                                 .slowest_stage_only = true,
+                                 .critical_path_only = true,
+                                 .delay_first_objective = true,
+                                 .critical_stage_only = true,
+                                 .best_improvement = true,
+                                 .max_move_distance = 2}));
+    return refined_schedule;
+  }
+
+  if (!options.pipeline_stages().has_value() &&
+      !options.clock_period_ps().has_value()) {
+    return absl::InvalidArgumentError(
+        "Pipeline scheduling requires either --pipeline_stages or "
+        "--clock_period_ps to be specified; see "
+        "https://google.github.io/xls/codegen_options/"
+        "#pipelining-and-scheduling-options for details.");
+  }
+
+  if (f->IsProc() && f->AsProcOrDie()->is_new_style_proc() &&
+      !elab.has_value()) {
+    return absl::InvalidArgumentError(
+        "Pipeline scheduling of a proc with proc-scoped channels requires an "
+        "elaboration.");
+  }
+
+  int64_t input_delay = options.additional_input_delay_ps().value_or(0);
+  int64_t output_delay = options.additional_output_delay_ps().value_or(0);
+  // Sends and receives each have inputs and outputs from the flow control
+  // signals, so the max of input and output delays is the amount needed for
+  // each channel.
+  int64_t max_io_delay = std::max(input_delay, output_delay);
+
+  DecoratingDelayEstimator io_delay_added(
+      "io_delay_added", delay_estimator, [&](Node* node, int64_t base_delay) {
+        if (node->Is<ChannelNode>()) {
+          std::string_view channel_name =
+              node->As<ChannelNode>()->channel_name();
+          std::string channel_op = absl::StrCat(
+              channel_name, ":",
+              node->As<ChannelNode>()->direction() == ChannelDirection::kSend
+                  ? "send"
+                  : "recv");
+          int64_t channel_delay_ps = 0;
+          if (std::optional<int64_t> op_delay =
+                  options.additional_channel_delay_ps(channel_op);
+              op_delay.has_value()) {
+            channel_delay_ps = *op_delay;
+          } else if (std::optional<int64_t> channel_delay =
+                         options.additional_channel_delay_ps(channel_name);
+                     channel_delay.has_value()) {
+            channel_delay_ps = *channel_delay;
+          }
+
+          if (IsExternalIoNode(node->As<ChannelNode>(), elab)) {
+            return base_delay + max_io_delay + channel_delay_ps;
+          }
+
+          return base_delay + channel_delay_ps;
+        }
+        if (node->function_base()->IsFunction()) {
+          if (node->Is<Param>()) {
+            return base_delay + input_delay;
+          }
+          if (node->function_base()->AsFunctionOrDie()->return_value() ==
+              node) {
+            return base_delay + output_delay;
+          }
+        }
+        return base_delay;
+      });
+
+  if (options.worst_case_throughput().has_value()) {
+    f->SetInitiationInterval(*options.worst_case_throughput());
+  }
+
+  if (options.pipeline_stages() == 1 &&
+      !options.clock_period_ps().has_value() &&
+      !options.failure_behavior().explain_infeasibility) {
+    // No scheduling to be done, and there's no way to violate timing; just
+    // schedule everything (other than literals) in the first cycle.
+    ScheduleCycleMap cycle_map;
+    for (Node* node : TopoSort(f)) {
+      if (!IsUntimed(node)) {
+        cycle_map[node] = 0;
+      }
+    }
+    PipelineSchedule schedule =
+        PipelineSchedule(f, std::move(cycle_map), options.pipeline_stages());
+    XLS_RETURN_IF_ERROR(schedule.Verify());
+    XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(options.constraints(),
+                                                   f->GetInitiationInterval()));
+
+    XLS_VLOG_LINES(3, "Schedule\n" + schedule.ToString());
+    return schedule;
+  }
+
+  std::unique_ptr<SDCScheduler> sdc_scheduler;
+  auto initialize_sdc_scheduler = [&]() -> absl::Status {
+    if (sdc_scheduler == nullptr) {
+      XLS_ASSIGN_OR_RETURN(sdc_scheduler,
+                           SDCScheduler::Create(f, io_delay_added, options));
+      XLS_RETURN_IF_ERROR(sdc_scheduler->AddConstraints(options.constraints()));
+    }
+    return absl::OkStatus();
+  };
+
+  std::optional<int64_t> min_clock_period_ps_for_tracing;
+  int64_t clock_period_ps;
+  if (!options.clock_period_ps().has_value() ||
+      (options.minimize_clock_on_failure().value_or(false) &&
+       options.recover_after_minimizing_clock().value_or(false))) {
+    // We don't know the exact target clock period - either none was provided,
+    // or we want to fall back to the minimum feasible clock period if the
+    // target is infeasible. Determine the minimum clock period for which the
+    // function can be scheduled in the given pipeline length (adjusted for the
+    // user-specified relaxation percent if needed), and use that if it's
+    // smaller than the target clock period.
+    //
+    // NOTE: We currently use the SDC scheduler to determine the minimum clock
+    //       period (if not specified), even if we're not using it for the final
+    //       schedule.
+    XLS_RETURN_IF_ERROR(initialize_sdc_scheduler());
+    XLS_ASSIGN_OR_RETURN(
+        min_clock_period_ps_for_tracing,
+        FindMinimumClockPeriod(
+            f, options.pipeline_stages(),
+            /*worst_case_throughput=*/f->IsProc() ? f->GetInitiationInterval()
+                                                  : std::nullopt,
+            io_delay_added, *sdc_scheduler, options.failure_behavior()));
+
+    // Pad the minimum clock period to account for the clock margin.
+    if (options.clock_margin_percent().has_value()) {
+      if (*options.clock_margin_percent() >= 100) {
+        return absl::InvalidArgumentError(
+            "Clock margin percent must be less than 100.");
+      }
+      *min_clock_period_ps_for_tracing =
+          (*min_clock_period_ps_for_tracing * 100 + 50) /
+          (100 - *options.clock_margin_percent());
+    }
+
+    // Set the clock period to the minimum feasible value.
+    clock_period_ps = *min_clock_period_ps_for_tracing;
+
+    if (options.period_relaxation_percent().has_value()) {
+      // Apply the user-specified relaxation to allow less evenly distributed
+      // slack.
+      int64_t relaxation_percent = options.period_relaxation_percent().value();
+      clock_period_ps += (clock_period_ps * relaxation_percent + 50) / 100;
+    }
+
+    if (options.clock_period_ps().has_value()) {
+      // If the user specified a clock period, and it's at least as long as our
+      // relaxed minimum clock period, use that instead; no need to squeeze the
+      // stages for a tighter clock than the user's target.
+      clock_period_ps = std::max(clock_period_ps, *options.clock_period_ps());
+    }
+
+    if (options.clock_period_ps().has_value() &&
+        clock_period_ps > *options.clock_period_ps()) {
+      CHECK(options.minimize_clock_on_failure().value_or(false));
+      CHECK(options.recover_after_minimizing_clock().value_or(false));
+      LOG(WARNING) << "Target clock period was " << *options.clock_period_ps()
+                   << ", but shortest feasible clock period (after any "
+                      "specified relaxation) is "
+                   << clock_period_ps
+                   << " ps; continuing with clock period = " << clock_period_ps
+                   << " ps.";
+    }
+  } else {
+    clock_period_ps = options.clock_period_ps().value();
+  }
+
+  XLS_ASSIGN_OR_RETURN(clock_period_ps,
+                       ApplyClockMargin(options, clock_period_ps));
+
+  std::optional<int64_t> worst_case_throughput = std::nullopt;
+  if (options.minimize_worst_case_throughput().value_or(false) && f->IsProc() &&
+      f->GetInitiationInterval().value_or(1) <= 0 &&
+      absl::c_any_of(
+          options.constraints(), [](const SchedulingConstraint& constraint) {
+            return std::holds_alternative<BackedgeConstraint>(constraint);
+          })) {
+    // NOTE: We currently use the SDC scheduler to minimize the worst-case
+    //       throughput (if minimization is requested), even if we're not using
+    //       it for the final schedule.
+    XLS_RETURN_IF_ERROR(initialize_sdc_scheduler());
+    absl::StatusOr<int64_t> wct = FindMinimumWorstCaseThroughput(
+        f, options.pipeline_stages(), clock_period_ps, *sdc_scheduler,
+        /*failure_behavior=*/{.explain_infeasibility = false});
+    if (wct.ok()) {
+      worst_case_throughput = *wct;
+      f->AsProcOrDie()->SetInitiationInterval(*wct);
+      LOG(INFO) << "Minimized worst-case throughput for proc '" << f->name()
+                << "': " << *worst_case_throughput;
+    } else {
+      VLOG(2) << "Failed to minimize worst-case throughput for proc '"
+              << f->name() << "', continuing to allow normal error handling: "
+              << wct.status();
+    }
+  }
+
+  ScheduleCycleMap cycle_map;
+  if (options.strategy() == SchedulingStrategy::SDC) {
+    // Enable iterative SDC scheduling when use_fdo is true
+    if (options.use_fdo()) {
+      if (!options.clock_period_ps().has_value()) {
+        return absl::UnimplementedError(
+            "Iterative SDC scheduling is only supported when a clock period is "
+            "specified.");
+      }
+
+      IterativeSDCSchedulingOptions isdc_options;
+      isdc_options.synthesizer = synthesizer;
+      isdc_options.iteration_number = options.fdo_iteration_number();
+      isdc_options.delay_driven_path_number =
+          options.fdo_delay_driven_path_number();
+      isdc_options.fanout_driven_path_number =
+          options.fdo_fanout_driven_path_number();
+      isdc_options.stochastic_ratio = options.fdo_refinement_stochastic_ratio();
+      isdc_options.path_evaluate_strategy =
+          options.fdo_path_evaluate_strategy();
+
+      DelayManager delay_manager(f, delay_estimator);
+      XLS_ASSIGN_OR_RETURN(
+          cycle_map,
+          ScheduleByIterativeSDC(f, options.pipeline_stages(), clock_period_ps,
+                                 delay_manager, options.constraints(),
+                                 isdc_options, options.failure_behavior()));
+
+      // Use delay manager for scheduling timing verification.
+      auto schedule = PipelineSchedule(f, cycle_map, options.pipeline_stages());
+      XLS_RETURN_IF_ERROR(schedule.Verify());
+      XLS_RETURN_IF_ERROR(
+          schedule.VerifyTiming(clock_period_ps, delay_manager));
+      XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(
+          options.constraints(), f->GetInitiationInterval()));
+
+      XLS_VLOG_LINES(3, "Schedule\n" + schedule.ToString());
+      return schedule;
+    }
+
+    XLS_RETURN_IF_ERROR(initialize_sdc_scheduler());
+    absl::StatusOr<ScheduleCycleMap> schedule_cycle_map =
+        sdc_scheduler->Schedule(options.pipeline_stages(), clock_period_ps,
+                                options.failure_behavior(),
+                                /*check_feasibility=*/false,
+                                worst_case_throughput,
+                                options.dynamic_throughput_objective_weight());
+    if (!schedule_cycle_map.ok()) {
+      if (absl::IsInvalidArgument(schedule_cycle_map.status())) {
+        // The scheduler was able to explain the failure; report it up without
+        // further analysis.
+        return std::move(schedule_cycle_map).status();
+      }
+      if (options.clock_period_ps().has_value()) {
+        // The user specified a specific clock period; see if we can confirm
+        // that that's the issue.
+
+        if (options.minimize_clock_on_failure().value_or(true)) {
+          // Find the smallest clock period that would have worked.
+          LOG(LEVEL(options.recover_after_minimizing_clock().value_or(false)
+                        ? absl::LogSeverity::kWarning
+                        : absl::LogSeverity::kError))
+              << "Unable to schedule with the specified clock period ("
+              << clock_period_ps
+              << " ps); finding the shortest feasible clock period...";
+          int64_t target_clock_period_ps = clock_period_ps + 1;
+          XLS_RETURN_IF_ERROR(initialize_sdc_scheduler());
+          absl::StatusOr<int64_t> min_clock_period_ps = FindMinimumClockPeriod(
+              f, options.pipeline_stages(), worst_case_throughput,
+              io_delay_added, *sdc_scheduler, options.failure_behavior(),
+              target_clock_period_ps);
+          if (min_clock_period_ps.ok()) {
+            min_clock_period_ps_for_tracing = *min_clock_period_ps;
+            // Just increasing the clock period suffices.
+            return absl::InvalidArgumentError(absl::StrFormat(
+                "cannot achieve the specified clock period. Try "
+                "`--clock_period_ps=%d`.",
+                *min_clock_period_ps));
+          }
+          if (absl::IsInvalidArgument(min_clock_period_ps.status())) {
+            // We failed with an explained error at the longest possible clock
+            // period. Report this error up, adding that the clock period will
+            // also need to be increased - though we don't know by how much.
+            return xabsl::StatusBuilder(std::move(min_clock_period_ps).status())
+                       .SetPrepend()
+                   << absl::StrFormat(
+                          "cannot achieve the specified clock period; try "
+                          "increasing `--clock_period_ps`. Also, ");
+          }
+          // We fail with an unexplained error even at the longest possible
+          // clock period. Report the original error.
+          return std::move(schedule_cycle_map).status();
+        }
+
+        // Check if just increasing the clock period would have helped.
+        XLS_ASSIGN_OR_RETURN(int64_t pessimistic_clock_period_ps,
+                             ComputeCriticalPath(f, io_delay_added));
+        // Make a copy of failure behavior with explain_feasibility true- we
+        // always want to produce an error message because this we are
+        // re-running the scheduler for its error message.
+        SchedulingFailureBehavior pessimistic_failure_behavior =
+            options.failure_behavior();
+        pessimistic_failure_behavior.explain_infeasibility = true;
+        XLS_RETURN_IF_ERROR(initialize_sdc_scheduler());
+        absl::Status pessimistic_status =
+            sdc_scheduler
+                ->Schedule(options.pipeline_stages(),
+                           pessimistic_clock_period_ps,
+                           pessimistic_failure_behavior,
+                           /*check_feasibility=*/true)
+                .status();
+        if (pessimistic_status.ok()) {
+          // Just increasing the clock period suffices.
+          return absl::InvalidArgumentError(
+              "cannot achieve the specified clock period. Try increasing "
+              "`--clock_period_ps`.");
+        }
+        if (absl::IsInvalidArgument(pessimistic_status)) {
+          // We failed with an explained error at the pessimistic clock period.
+          // Report this error up, adding that the clock period will also need
+          // to be increased - though we don't know by how much.
+          return xabsl::StatusBuilder(std::move(pessimistic_status))
+                     .SetPrepend()
+                 << absl::StrFormat(
+                        "cannot achieve the specified clock period; try "
+                        "increasing `--clock_period_ps`. Also, ");
+        }
+        return pessimistic_status;
+      }
+      return schedule_cycle_map.status();
+    }
+    cycle_map = *std::move(schedule_cycle_map);
+  } else {
+    // Run an initial ASAP/ALAP scheduling pass, which we'll refine with the
+    // chosen scheduler.
+    // First get the basic bounds.
+    XLS_ASSIGN_OR_RETURN(
+        auto bounds,
+        sched::ScheduleBounds::Create(
+            ScheduleGraph::Create(f, GetDeadAfterSynthesisNodes(f)),
+            clock_period_ps, io_delay_added,
+            f->GetInitiationInterval().value_or(1), options.constraints()));
+    // Add first and last stage constraints.
+    using LastStageConstraint =
+        sched::ScheduleBounds::NodeSchedulingConstraint::LastStageConstraint;
+    for (Node* n : FirstStageNodes(f)) {
+      bounds.AddConstraint(NodeInCycleConstraint{n, 0});
+    }
+    for (Node* n : FinalStageNodes(f)) {
+      bounds.AddConstraint(LastStageConstraint{n});
+    }
+    absl::Status tighten_bounds_status =
+        TightenBounds(bounds, f, options.pipeline_stages());
+    if (!tighten_bounds_status.ok()) {
+      return GenerateHelpfulAsapError(std::move(tighten_bounds_status), f,
+                                      clock_period_ps, io_delay_added, options);
+    }
+
+    if (options.strategy() == SchedulingStrategy::MIN_CUT) {
+      XLS_ASSIGN_OR_RETURN(
+          cycle_map,
+          MinCutScheduler(
+              f,
+              options.pipeline_stages().value_or(bounds.max_lower_bound() + 1),
+              clock_period_ps, io_delay_added, &bounds, options.constraints()));
+    } else if (options.strategy() == SchedulingStrategy::RANDOM) {
+      std::mt19937_64 gen(options.seed().value_or(0));
+
+      cycle_map = ScheduleCycleMap();
+      for (Node* node : TopoSort(f)) {
+        if (IsUntimed(node)) {
+          continue;
+        }
+        int64_t cycle = absl::Uniform<int64_t>(
+            absl::IntervalClosed, gen, bounds.lb(node), bounds.ub(node));
+        if (bounds.lb(node) != bounds.ub(node)) {
+          XLS_RETURN_IF_ERROR(bounds.TightenNodeLb(node, cycle));
+          XLS_RETURN_IF_ERROR(bounds.TightenNodeUb(node, cycle));
+          // TODO(allight): We might want to give this more fuel.
+          XLS_RETURN_IF_ERROR(bounds.PropagateBounds());
+        }
+        cycle_map[node] = cycle;
+      }
+    } else {
+      XLS_RET_CHECK(options.strategy() == SchedulingStrategy::ASAP);
+      XLS_RET_CHECK(!options.pipeline_stages().has_value() ||
+                    options.pipeline_stages() == 1 ||
+                    options.pipeline_stages() >= bounds.max_lower_bound() + 1)
+          << "Pipeline stages must be at least 1 or greater than or equal to "
+             "the number of stages in the function. pipeline_stages: "
+          << (options.pipeline_stages() ? *options.pipeline_stages() : -1)
+          << " max_lower_bound: " << bounds.max_lower_bound();
+      // Just schedule everything as soon as possible.
+      for (Node* node : f->nodes()) {
+        cycle_map[node] = bounds.lb(node);
+      }
+    }
+  }
+
+  auto schedule = PipelineSchedule(f, cycle_map, options.pipeline_stages(),
+                                   min_clock_period_ps_for_tracing);
+  XLS_RETURN_IF_ERROR(schedule.Verify());
+  XLS_RETURN_IF_ERROR(schedule.VerifyTiming(clock_period_ps, io_delay_added));
+  XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(options.constraints(),
+                                                 f->GetInitiationInterval()));
+
+  XLS_VLOG_LINES(3, "Schedule\n" + schedule.ToString());
+  return schedule;
+}
+
+}  // namespace
+
+absl::StatusOr<PipelineSchedule> RunPipelineSchedule(
+    FunctionBase* f, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options,
+    std::optional<const ProcElaboration*> elab) {
+  return RunPipelineScheduleInternal(f, delay_estimator, options, elab,
+                                     /*synthesizer=*/nullptr);
+}
+
+absl::StatusOr<PipelineSchedule> RunPipelineScheduleWithFdo(
+    FunctionBase* f, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options, const synthesis::Synthesizer& synthesizer,
+    std::optional<const ProcElaboration*> elab) {
+  return RunPipelineScheduleInternal(f, delay_estimator, options, elab,
+                                     &synthesizer);
+}
+
+absl::StatusOr<PackageSchedule> RunSynchronousPipelineSchedule(
+    Package* package, const DelayEstimator& delay_estimator,
+    const SchedulingOptions& options, const ProcElaboration& elab) {
+  // TODO(https://github.com/google/xls/issues/2175): Synchronous scheduling
+  // currently only supports a clock period option.
+  XLS_RET_CHECK(options.clock_period_ps().has_value());
+  XLS_RET_CHECK(!options.pipeline_stages().has_value());
+  XLS_RET_CHECK(!options.worst_case_throughput().has_value());
+  XLS_RET_CHECK(!options.clock_margin_percent().has_value());
+  XLS_RET_CHECK(!options.period_relaxation_percent().has_value());
+  XLS_RET_CHECK(!options.use_fdo());
+  XLS_RET_CHECK(!options.additional_input_delay_ps().has_value());
+  XLS_RET_CHECK(!options.additional_output_delay_ps().has_value());
+  XLS_RET_CHECK(options.strategy() == SchedulingStrategy::SDC);
+
+  // TODO(https://github.com/google/xls/issues/2175): Current limitations are
+  // that all sends and receives mush be unconditional and procs can only be
+  // instantiated once.
+  for (Proc* proc : elab.procs()) {
+    if (elab.GetInstances(proc).size() != 1) {
+      return absl::UnimplementedError(
+          absl::StrFormat("Proc `%s` is instantiated more than once which is "
+                          "not supported with synchronous procs.",
+                          proc->name()));
+    }
+    for (Node* node : proc->nodes()) {
+      if (node->Is<ChannelNode>() &&
+          node->As<ChannelNode>()->predicate().has_value()) {
+        return absl::UnimplementedError(
+            absl::StrFormat("Send/receive node `%s` is predicated which is not "
+                            "supported with synchronous procs.",
+                            node->GetName()));
+      }
+    }
+  }
+
+  XLS_ASSIGN_OR_RETURN(
+      ScheduleGraph graph,
+      ScheduleGraph::CreateSynchronousGraph(package, /*loopback_channels=*/{},
+                                            elab, /*dead_after_synthesis=*/{}));
+
+  XLS_ASSIGN_OR_RETURN(std::unique_ptr<SDCScheduler> sdc_scheduler,
+                       SDCScheduler::Create(graph, delay_estimator, options));
+  XLS_RETURN_IF_ERROR(sdc_scheduler->AddConstraints(options.constraints()));
+
+  XLS_ASSIGN_OR_RETURN(
+      ScheduleCycleMap cycle_map,
+      sdc_scheduler->Schedule(std::nullopt, *options.clock_period_ps(),
+                              options.failure_behavior()));
+
+  // Convert the global cycle map of all nodes in the package to individual
+  // schedules for each proc.
+  //
+  // * For the top-level proc, the schedule cycle for each node X is the cycle
+  //   in the global schedule (cycle_map[X]).
+  //
+  // * For all other procs, the schedule cycle for a node X is cycle_map[X]
+  //   minus the minimum cycle for any node in the proc.
+  //
+  // The computed adjustments for each proc are saved in `synchronous_offsets`.
+  absl::flat_hash_map<FunctionBase*, int64_t> synchronous_offsets;
+  // Iterate through the proc hierarchy from the bottom up.
+  for (auto it = elab.procs().crbegin(); it != elab.procs().crend(); ++it) {
+    Proc* proc = *it;
+
+    int64_t earliest_stage;
+    if (proc == elab.top()->proc() || proc->node_count() == 0) {
+      earliest_stage = 0;
+    } else {
+      earliest_stage = std::numeric_limits<int64_t>::max();
+      for (Node* node : proc->nodes()) {
+        if (IsUntimed(node)) {
+          continue;
+        }
+        earliest_stage = std::min(earliest_stage, cycle_map.at(node));
+      }
+    }
+    synchronous_offsets[proc] = earliest_stage;
+  }
+
+  PackageSchedule::ScheduleMap schedule_map;
+  for (Proc* proc : elab.procs()) {
+    absl::flat_hash_map<Node*, int64_t> proc_cycle_map;
+    for (Node* node : proc->nodes()) {
+      if (IsUntimed(node)) {
+        continue;
+      }
+      proc_cycle_map[node] = cycle_map.at(node) - synchronous_offsets.at(proc);
+    }
+    PipelineSchedule schedule(proc, proc_cycle_map);
+    schedule_map[proc] = PipelineSchedule(proc, proc_cycle_map);
+  }
+
+  PackageSchedule package_schedule(package, std::move(schedule_map),
+                                   std::move(synchronous_offsets));
+  VLOG(2) << package_schedule.ToString();
+  return package_schedule;
+}
+
+}  // namespace xls

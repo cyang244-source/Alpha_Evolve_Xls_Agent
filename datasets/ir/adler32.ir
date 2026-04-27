@@ -1,0 +1,39 @@
+package adler32
+
+file_number 0 "xls/examples/adler32/adler32.x"
+
+fn ____adler32__adler32_seq_counted_for_0_body(__: bits[8] id=5, __loop_carry: (bits[32], bits[32]) id=8, buf: bits[8] id=16) -> (bits[32], bits[32]) {
+  tuple_index.10: bits[32] = tuple_index(__loop_carry, index=0, id=10)
+  zero_ext.17: bits[32] = zero_ext(buf, new_bit_count=32, id=17)
+  add.18: bits[32] = add(tuple_index.10, zero_ext.17, id=18, pos=[(0,21,17)])
+  literal.19: bits[32] = literal(value=65521, id=19, pos=[(0,21,37)])
+  tuple_index.13: bits[32] = tuple_index(__loop_carry, index=1, id=13)
+  a: bits[32] = umod(add.18, literal.19, id=20, pos=[(0,21,17)])
+  literal.9: bits[1] = literal(value=1, id=9)
+  literal.11: bits[1] = literal(value=1, id=11)
+  add.21: bits[32] = add(tuple_index.13, a, id=21, pos=[(0,22,17)])
+  literal.22: bits[32] = literal(value=65521, id=22, pos=[(0,22,26)])
+  literal.6: bits[8] = literal(value=0, id=6)
+  and.12: bits[1] = and(literal.9, literal.11, id=12)
+  literal.14: bits[1] = literal(value=1, id=14)
+  b: bits[32] = umod(add.21, literal.22, id=23, pos=[(0,22,17)])
+  add.7: bits[8] = add(__, literal.6, id=7)
+  and.15: bits[1] = and(and.12, literal.14, id=15)
+  ret tuple.24: (bits[32], bits[32]) = tuple(a, b, id=24, pos=[(0,23,8)])
+}
+
+fn __adler32__adler32_seq(buf: bits[8] id=1) -> bits[32] {
+  a: bits[32] = literal(value=1, id=2, pos=[(0,17,12)])
+  b: bits[32] = literal(value=0, id=3, pos=[(0,18,12)])
+  tuple.4: (bits[32], bits[32]) = tuple(a, b, id=4, pos=[(0,24,6)])
+  counted_for.25: (bits[32], bits[32]) = counted_for(tuple.4, trip_count=1, stride=1, body=____adler32__adler32_seq_counted_for_0_body, invariant_args=[buf], id=25, pos=[(0,20,17)])
+  b__1: bits[32] = tuple_index(counted_for.25, index=1, id=27, pos=[(0,20,12)])
+  literal.28: bits[32] = literal(value=16, id=28, pos=[(0,25,10)])
+  shll.29: bits[32] = shll(b__1, literal.28, id=29, pos=[(0,25,5)])
+  a__1: bits[32] = tuple_index(counted_for.25, index=0, id=26, pos=[(0,20,9)])
+  ret or.30: bits[32] = or(shll.29, a__1, id=30, pos=[(0,25,5)])
+}
+
+top fn __adler32__main(message: bits[8] id=31) -> bits[32] {
+  ret invoke.32: bits[32] = invoke(message, to_apply=__adler32__adler32_seq, id=32, pos=[(0,28,41)])
+}

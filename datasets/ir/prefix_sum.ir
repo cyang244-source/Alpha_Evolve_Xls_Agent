@@ -1,0 +1,45 @@
+package prefix_sum
+
+file_number 0 "xls/dslx/stdlib/std.x"
+file_number 1 "xls/examples/prefix_sum.x"
+
+fn __std__flog2__32(x: bits[32] id=1) -> bits[32] {
+  reverse.6: bits[32] = reverse(x, id=6, pos=[(0,686,78)])
+  one_hot.7: bits[33] = one_hot(reverse.6, lsb_prio=true, id=7, pos=[(0,686,78)])
+  N: bits[32] = literal(value=32, id=2, pos=[(0,686,13)])
+  encode.8: bits[6] = encode(one_hot.7, id=8, pos=[(0,686,78)])
+  zero_ext.5: bits[32] = zero_ext(N, new_bit_count=32, id=5)
+  zero_ext.9: bits[32] = zero_ext(encode.8, new_bit_count=32, id=9, pos=[(0,686,78)])
+  literal.3: bits[32] = literal(value=1, id=3, pos=[(0,686,54)])
+  sub.10: bits[32] = sub(zero_ext.5, zero_ext.9, id=10, pos=[(0,686,59)])
+  literal.11: bits[32] = literal(value=1, id=11, pos=[(0,686,84)])
+  uge.4: bits[1] = uge(x, literal.3, id=4, pos=[(0,686,49)])
+  literal.13: bits[32] = literal(value=0, id=13, pos=[(0,686,95)])
+  sub.12: bits[32] = sub(sub.10, literal.11, id=12, pos=[(0,686,59)])
+  ret sel.14: bits[32] = sel(uge.4, cases=[literal.13, sub.12], id=14, pos=[(0,686,46)])
+}
+
+fn ______prefix_sum__prefix_sum_counted_for_0_body_counted_for_0_body(j: bits[32] id=24, updated: bits[16][16] id=27, c: bits[16][16] id=28, lookback: bits[32] id=29) -> bits[16][16] {
+  literal.25: bits[32] = literal(value=0, id=25)
+  add.26: bits[32] = add(j, literal.25, id=26)
+  sub.32: bits[32] = sub(add.26, lookback, id=32, pos=[(1,28,59)])
+  array_index.31: bits[16] = array_index(c, indices=[add.26], id=31, pos=[(1,28,51)])
+  array_index.33: bits[16] = array_index(c, indices=[sub.32], id=33, pos=[(1,28,58)])
+  add.34: bits[16] = add(array_index.31, array_index.33, id=34, pos=[(1,28,51)])
+  uge.30: bits[1] = uge(add.26, lookback, id=30, pos=[(1,28,15)])
+  array_update.35: bits[16][16] = array_update(updated, add.34, indices=[add.26], id=35, pos=[(1,28,37)])
+  ret sel.36: bits[16][16] = sel(uge.30, cases=[updated, array_update.35], id=36, pos=[(1,28,12)])
+}
+
+fn ____prefix_sum__prefix_sum_counted_for_0_body(i: bits[32] id=17, c: bits[16][16] id=20, ARRAY_SIZE: bits[32] id=21) -> bits[16][16] {
+  literal.18: bits[32] = literal(value=0, id=18)
+  literal.22: bits[32] = literal(value=1, id=22, pos=[(1,26,23)])
+  add.19: bits[32] = add(i, literal.18, id=19)
+  lookback: bits[32] = shll(literal.22, add.19, id=23, pos=[(1,26,23)])
+  ret counted_for.37: bits[16][16] = counted_for(c, trip_count=16, stride=1, body=______prefix_sum__prefix_sum_counted_for_0_body_counted_for_0_body, invariant_args=[c, lookback], id=37, pos=[(1,27,8)])
+}
+
+top fn __prefix_sum__prefix_sum(values: bits[16][16] id=15) -> bits[16][16] {
+  ARRAY_SIZE: bits[32] = literal(value=16, id=16, pos=[(1,18,19)])
+  ret counted_for.38: bits[16][16] = counted_for(values, trip_count=4, stride=1, body=____prefix_sum__prefix_sum_counted_for_0_body, invariant_args=[ARRAY_SIZE], id=38, pos=[(1,25,4)])
+}

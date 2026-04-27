@@ -1,0 +1,83 @@
+package sparse_prefix_sum
+
+file_number 0 "xls/dslx/stdlib/std.x"
+file_number 1 "xls/examples/sparse_prefix_sum.x"
+
+fn ______sparse_prefix_sum__sparse_prefix_sum_counted_for_0_body_counted_for_0_body(s: bits[32] id=28, updated: bits[16][16] id=31, ARRAY_SIZE: bits[32] id=32, c: bits[16][16] id=33, half_step: bits[32] id=34, step: bits[32] id=35) -> bits[16][16] {
+  literal.29: bits[32] = literal(value=1, id=29)
+  add.30: bits[32] = add(s, literal.29, id=30)
+  umul.36: bits[32] = umul(add.30, step, id=36, pos=[(1,30,24)])
+  literal.37: bits[32] = literal(value=1, id=37, pos=[(1,30,35)])
+  index: bits[32] = sub(umul.36, literal.37, id=38, pos=[(1,30,24)])
+  sub.41: bits[32] = sub(index, half_step, id=41, pos=[(1,32,52)])
+  array_index.40: bits[16] = array_index(c, indices=[index], id=40, pos=[(1,32,40)])
+  array_index.42: bits[16] = array_index(c, indices=[sub.41], id=42, pos=[(1,32,51)])
+  add.43: bits[16] = add(array_index.40, array_index.42, id=43, pos=[(1,32,40)])
+  ult.39: bits[1] = ult(index, ARRAY_SIZE, id=39, pos=[(1,31,15)])
+  array_update.44: bits[16][16] = array_update(updated, add.43, indices=[index], id=44, pos=[(1,32,22)])
+  ret sel.45: bits[16][16] = sel(ult.39, cases=[updated, array_update.44], id=45, pos=[(1,31,12)])
+}
+
+fn ____sparse_prefix_sum__sparse_prefix_sum_counted_for_0_body(j: bits[32] id=17, c: bits[16][16] id=20, ARRAY_SIZE: bits[32] id=21) -> bits[16][16] {
+  literal.18: bits[32] = literal(value=0, id=18)
+  add.19: bits[32] = add(j, literal.18, id=19)
+  literal.23: bits[32] = literal(value=1, id=23, pos=[(1,27,33)])
+  literal.26: bits[32] = literal(value=1, id=26, pos=[(1,28,24)])
+  literal.22: bits[32] = literal(value=1, id=22, pos=[(1,27,19)])
+  add.24: bits[32] = add(add.19, literal.23, id=24, pos=[(1,27,29)])
+  half_step: bits[32] = shll(literal.26, add.19, id=27, pos=[(1,28,24)])
+  step: bits[32] = shll(literal.22, add.24, id=25, pos=[(1,27,19)])
+  ret counted_for.46: bits[16][16] = counted_for(c, trip_count=15, stride=1, body=______sparse_prefix_sum__sparse_prefix_sum_counted_for_0_body_counted_for_0_body, invariant_args=[ARRAY_SIZE, c, half_step, step], id=46, pos=[(1,29,8)])
+}
+
+fn __std__clog2__32(x: bits[32] id=1) -> bits[32] {
+  literal.6: bits[32] = literal(value=1, id=6, pos=[(0,713,83)])
+  sub.7: bits[32] = sub(x, literal.6, id=7, pos=[(0,713,79)])
+  reverse.8: bits[32] = reverse(sub.7, id=8, pos=[(0,713,78)])
+  one_hot.9: bits[33] = one_hot(reverse.8, lsb_prio=true, id=9, pos=[(0,713,78)])
+  N: bits[32] = literal(value=32, id=2, pos=[(0,713,13)])
+  encode.10: bits[6] = encode(one_hot.9, id=10, pos=[(0,713,78)])
+  literal.3: bits[32] = literal(value=1, id=3, pos=[(0,713,54)])
+  zero_ext.5: bits[32] = zero_ext(N, new_bit_count=32, id=5)
+  zero_ext.11: bits[32] = zero_ext(encode.10, new_bit_count=32, id=11, pos=[(0,713,78)])
+  uge.4: bits[1] = uge(x, literal.3, id=4, pos=[(0,713,49)])
+  literal.13: bits[32] = literal(value=0, id=13, pos=[(0,713,95)])
+  sub.12: bits[32] = sub(zero_ext.5, zero_ext.11, id=12, pos=[(0,713,59)])
+  ret sel.14: bits[32] = sel(uge.4, cases=[literal.13, sub.12], id=14, pos=[(0,713,46)])
+}
+
+fn ______sparse_prefix_sum__sparse_prefix_sum_counted_for_1_body_counted_for_0_body(s: bits[32] id=61, updated: bits[16][16] id=64, ARRAY_SIZE: bits[32] id=65, c: bits[16][16] id=66, half_step: bits[32] id=67, step: bits[32] id=68) -> bits[16][16] {
+  literal.62: bits[32] = literal(value=1, id=62)
+  add.63: bits[32] = add(s, literal.62, id=63)
+  umul.69: bits[32] = umul(add.63, step, id=69, pos=[(1,44,24)])
+  add.70: bits[32] = add(umul.69, half_step, id=70, pos=[(1,44,24)])
+  literal.71: bits[32] = literal(value=1, id=71, pos=[(1,44,47)])
+  index: bits[32] = sub(add.70, literal.71, id=72, pos=[(1,44,24)])
+  sub.75: bits[32] = sub(index, half_step, id=75, pos=[(1,46,52)])
+  array_index.74: bits[16] = array_index(c, indices=[index], id=74, pos=[(1,46,40)])
+  array_index.76: bits[16] = array_index(c, indices=[sub.75], id=76, pos=[(1,46,51)])
+  add.77: bits[16] = add(array_index.74, array_index.76, id=77, pos=[(1,46,40)])
+  ult.73: bits[1] = ult(index, ARRAY_SIZE, id=73, pos=[(1,45,15)])
+  array_update.78: bits[16][16] = array_update(updated, add.77, indices=[index], id=78, pos=[(1,46,22)])
+  ret sel.79: bits[16][16] = sel(ult.73, cases=[updated, array_update.78], id=79, pos=[(1,45,12)])
+}
+
+fn ____sparse_prefix_sum__sparse_prefix_sum_counted_for_1_body(i: bits[32] id=48, c: bits[16][16] id=51, ARRAY_SIZE: bits[32] id=52) -> bits[16][16] {
+  literal.49: bits[32] = literal(value=0, id=49)
+  invoke.53: bits[32] = invoke(ARRAY_SIZE, to_apply=__std__clog2__32, id=53, pos=[(1,40,26)])
+  add.50: bits[32] = add(i, literal.49, id=50)
+  j: bits[32] = sub(invoke.53, add.50, id=54, pos=[(1,40,26)])
+  literal.58: bits[32] = literal(value=1, id=58, pos=[(1,42,38)])
+  literal.57: bits[32] = literal(value=1, id=57, pos=[(1,42,24)])
+  sub.59: bits[32] = sub(j, literal.58, id=59, pos=[(1,42,34)])
+  literal.55: bits[32] = literal(value=1, id=55, pos=[(1,41,19)])
+  half_step: bits[32] = shll(literal.57, sub.59, id=60, pos=[(1,42,24)])
+  step: bits[32] = shll(literal.55, j, id=56, pos=[(1,41,19)])
+  ret counted_for.80: bits[16][16] = counted_for(c, trip_count=15, stride=1, body=______sparse_prefix_sum__sparse_prefix_sum_counted_for_1_body_counted_for_0_body, invariant_args=[ARRAY_SIZE, c, half_step, step], id=80, pos=[(1,43,8)])
+}
+
+top fn __sparse_prefix_sum__sparse_prefix_sum(values: bits[16][16] id=15) -> bits[16][16] {
+  ARRAY_SIZE: bits[32] = literal(value=16, id=16, pos=[(1,18,19)])
+  swept: bits[16][16] = counted_for(values, trip_count=4, stride=1, body=____sparse_prefix_sum__sparse_prefix_sum_counted_for_0_body, invariant_args=[ARRAY_SIZE], id=47, pos=[(1,26,16)])
+  ret counted_for.81: bits[16][16] = counted_for(swept, trip_count=4, stride=1, body=____sparse_prefix_sum__sparse_prefix_sum_counted_for_1_body, invariant_args=[ARRAY_SIZE], id=81, pos=[(1,39,4)])
+}

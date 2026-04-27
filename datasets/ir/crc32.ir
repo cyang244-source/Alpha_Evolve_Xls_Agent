@@ -1,0 +1,28 @@
+package crc32
+
+file_number 0 "xls/examples/crc32/crc32.x"
+
+fn ____crc32__crc32_one_byte_counted_for_0_body(__: bits[32] id=6, crc: bits[32] id=9, polynomial: bits[32] id=10) -> bits[32] {
+  literal.11: bits[32] = literal(value=1, id=11, pos=[(0,27,27)])
+  and.12: bits[32] = and(crc, literal.11, id=12, pos=[(0,27,21)])
+  literal.14: bits[32] = literal(value=1, id=14, pos=[(0,28,16)])
+  mask: bits[32] = neg(and.12, id=13, pos=[(0,27,19)])
+  literal.7: bits[32] = literal(value=0, id=7)
+  shrl.15: bits[32] = shrl(crc, literal.14, id=15, pos=[(0,28,9)])
+  and.16: bits[32] = and(polynomial, mask, id=16, pos=[(0,28,26)])
+  add.8: bits[32] = add(__, literal.7, id=8)
+  ret xor.17: bits[32] = xor(shrl.15, and.16, id=17, pos=[(0,28,9)])
+}
+
+fn __crc32__crc32_one_byte(byte: bits[8] id=1, polynomial: bits[32] id=2, crc: bits[32] id=3) -> bits[32] {
+  zero_ext.4: bits[32] = zero_ext(byte, new_bit_count=32, id=4)
+  crc__1: bits[32] = xor(crc, zero_ext.4, id=5, pos=[(0,24,14)])
+  ret counted_for.18: bits[32] = counted_for(crc__1, trip_count=8, stride=1, body=____crc32__crc32_one_byte_counted_for_0_body, invariant_args=[polynomial], id=18, pos=[(0,26,4)])
+}
+
+top fn __crc32__main(message: bits[8] id=19) -> bits[32] {
+  literal.21: bits[32] = literal(value=3988292384, id=21, pos=[(0,32,54)])
+  U32_MAX: bits[32] = literal(value=4294967295, id=20, pos=[(0,21,39)])
+  invoke.22: bits[32] = invoke(message, literal.21, U32_MAX, to_apply=__crc32__crc32_one_byte, id=22, pos=[(0,32,44)])
+  ret xor.23: bits[32] = xor(invoke.22, U32_MAX, id=23, pos=[(0,32,44)])
+}
