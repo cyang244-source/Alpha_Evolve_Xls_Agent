@@ -82,6 +82,12 @@ bazel --batch build --jobs=16 -c opt //xls/dev_tools:benchmark_main
 The detailed workflow is described in:
 
 - `docs/workflow.md`
+- `docs/reproduction_guide.md`
+
+If you want the shortest setup path for running the workflow on top of a fresh
+Google XLS checkout, see:
+
+- `docs/quick_start.md`
 
 ## Main Experimental Finding
 
