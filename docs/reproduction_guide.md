@@ -57,13 +57,13 @@ This `xls` directory will be the workspace where the workflow runs.
 Clone this repository separately:
 
 ```bash
-git clone <your-project-repo-url>
+git clone https://github.com/ChiehCheng-Yang/Alpha_Evolve_XLS_Agent.git
 ```
 
 For example:
 
 ```bash
-git clone https://github.com/<your-username>/Alpha_Evolve_XLS_Agent.git
+git clone https://github.com/ChiehCheng-Yang/Alpha_Evolve_XLS_Agent.git
 ```
 
 In the rest of this document, we assume the project repository is available locally as:

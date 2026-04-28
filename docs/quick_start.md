@@ -6,7 +6,7 @@ This is the shortest setup flow for running the AI-agent-driven XLS workflow fro
 
 ```bash
 git clone https://github.com/google/xls.git
-git clone https://github.com/cyang244-source/Alpha_Evolve_XLS_Agent.git
+git clone https://github.com/ChiehCheng-Yang/Alpha_Evolve_XLS_Agent.git
 cd xls
 
 cp ../Alpha_Evolve_XLS_Agent/scripts/run_agent.py xls/
